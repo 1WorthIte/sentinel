@@ -112,12 +112,12 @@ R,<angle_deg>,<distance_cm>,<limit_cm>
 
 <!-- TODO: fill this table from a ruler test (average of ~20 readings per distance) before publishing -->
 
-| True distance (cm) | Mean reading (cm) | Error (cm) |
+| True distance (cm) | Mean reading (cm) | Error (%) |
 |---|---|---|
-| 10 | TODO | TODO |
-| 20 | TODO | TODO |
-| 40 | TODO | TODO |
-| 80 | TODO | TODO |
+| 10 | 9.55 | 4.5 |
+| 20 | 18.73 | 6.4 |
+| 40 | 39.29 | 1.8 |
+| 80 | 77.45 | 3.2 |
 
 ## Limitations and next steps
 
