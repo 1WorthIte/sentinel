@@ -1,0 +1,447 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sentinel Radar</title>
+<style>
+  :root {
+    --bg: #02100a;
+    --fg: #7dffb2;
+    --dim: #2a8f5a;
+    --red: #ff5a5a;
+    --amber: #ffb84d;
+    --panel: rgba(2, 20, 12, 0.80);
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: var(--bg); color: var(--fg);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+
+  #panel {
+    position: fixed; top: 16px; left: 16px; min-width: 240px;
+    padding: 14px 16px; border-radius: 10px;
+    background: var(--panel); border: 1px solid var(--dim);
+    backdrop-filter: blur(4px);
+    transition: border-color .15s, box-shadow .15s;
+  }
+  #panel.alert { border-color: var(--red); box-shadow: 0 0 22px rgba(255, 90, 90, .45); }
+  .title { font-size: 15px; letter-spacing: .28em; font-weight: 700; }
+  .title span { color: var(--dim); }
+  .status { display: flex; align-items: center; gap: 8px; margin: 10px 0 12px; font-size: 13px; letter-spacing: .12em; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: var(--dim); }
+  #dot.ok { background: var(--fg); box-shadow: 0 0 8px var(--fg); }
+  #dot.warn { background: var(--amber); box-shadow: 0 0 8px var(--amber); }
+  #dot.alert { background: var(--red); box-shadow: 0 0 10px var(--red); animation: blink .35s infinite alternate; }
+  @keyframes blink { to { opacity: .25; } }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 18px; margin: 0; font-size: 13px; }
+  dt { color: var(--dim); letter-spacing: .12em; }
+  dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+
+  #controls {
+    position: fixed; top: 16px; right: 16px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  button {
+    font: inherit; font-size: 12px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--fg); background: var(--panel); border: 1px solid var(--dim);
+    border-radius: 8px; padding: 8px 14px; cursor: pointer;
+  }
+  button:hover { border-color: var(--fg); }
+  button.on { background: var(--fg); color: #02100a; border-color: var(--fg); }
+  .seg { display: inline-flex; }
+  .seg button { border-radius: 0; margin-left: -1px; }
+  .seg button:first-child { border-radius: 8px 0 0 8px; margin-left: 0; }
+  .seg button:last-child { border-radius: 0 8px 8px 0; }
+
+  #msg {
+    position: fixed; left: 16px; bottom: 16px; max-width: min(560px, calc(100% - 32px));
+    padding: 10px 14px; border-radius: 8px; font-size: 13px;
+    background: var(--panel); border: 1px solid var(--amber); color: var(--amber);
+    display: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="panel">
+  <div class="title">SENTINEL <span>RADAR</span></div>
+  <div class="status"><i id="dot"></i><b id="status">NOT CONNECTED</b></div>
+  <dl>
+    <dt>ANGLE</dt>   <dd id="rAngle">--</dd>
+    <dt>DIST</dt>    <dd id="rDist">--</dd>
+    <dt>LIMIT</dt>   <dd id="rLim">--</dd>
+    <dt>NEAREST</dt> <dd id="rNear">--</dd>
+    <dt>RATE</dt>    <dd id="rRate">--</dd>
+  </dl>
+</div>
+
+<div id="controls">
+  <button id="btnConnect">Connect</button>
+  <button id="btnDemo">Demo</button>
+  <span class="seg" id="ranges">
+    <button data-r="50">50</button>
+    <button data-r="100" class="on">100</button>
+    <button data-r="200">200 cm</button>
+  </span>
+</div>
+<div id="msg"></div>
+
+<script>
+'use strict';
+
+// ---------- canvas setup ----------
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0;
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ---------- state ----------
+const HALF = 45;                 // sweep is -45 .. +45 degrees
+const FADE_MS = 4500;            // how long a blip stays visible
+const NO_ECHO_MAX = 400;         // anything outside 2..400 cm is treated as no echo
+
+const state = {
+  mode: 'idle',                  // idle | serial | demo
+  angle: 0, dir: 1,
+  dist: null, thr: 30,
+  lastRx: 0,
+  range: 100,
+};
+const blips = [];
+let rxTimes = [];
+
+function ingest(angle, dist, thr) {
+  const now = performance.now();
+  if (angle > state.angle) state.dir = 1;
+  else if (angle < state.angle) state.dir = -1;
+  state.angle = angle;
+  state.dist = (dist >= 2 && dist <= NO_ECHO_MAX) ? dist : null;
+  state.thr = thr;
+  state.lastRx = now;
+  rxTimes.push(now);
+  if (state.dist !== null) blips.push({ a: angle, d: state.dist, t: now, thr: thr });
+}
+
+// ---------- helpers ----------
+const rad = (deg) => deg * Math.PI / 180;
+const th = (a) => rad(-90 + a);       // sweep angle (0 = straight up) -> canvas angle
+
+function setText(id, text) {
+  const el = document.getElementById(id);
+  if (el.textContent !== text) el.textContent = text;
+}
+
+let msgTimer = null;
+function msg(text) {
+  const el = document.getElementById('msg');
+  el.textContent = text;
+  el.style.display = 'block';
+  clearTimeout(msgTimer);
+  msgTimer = setTimeout(() => { el.style.display = 'none'; }, 9000);
+}
+
+// ---------- drawing ----------
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (state.mode === 'demo') demoStep(now);
+
+  const cx = W / 2;
+  const cy = H - 56;
+  const R = Math.max(80, Math.min(cy - 28, (W / 2 - 30) / Math.sin(rad(HALF))));
+  const live = state.mode !== 'idle' && (state.mode === 'demo' || now - state.lastRx < 1500);
+
+  // background
+  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R * 1.15);
+  g.addColorStop(0, '#07301e');
+  g.addColorStop(1, '#02100a');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, W, H);
+
+  // fan area
+  ctx.beginPath();
+  ctx.moveTo(cx, cy);
+  ctx.arc(cx, cy, R, th(-HALF), th(HALF));
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(0, 255, 120, 0.045)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(125, 255, 178, 0.6)';
+  ctx.lineWidth = 1.5;
+  ctx.stroke();
+
+  // range rings and labels
+  ctx.font = '11px ui-monospace, Menlo, monospace';
+  ctx.textAlign = 'left';
+  const step = state.range / 5;
+  for (let i = 1; i <= 5; i++) {
+    const r = (i / 5) * R;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, th(-HALF), th(HALF));
+    ctx.strokeStyle = 'rgba(125, 255, 178, 0.22)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(125, 255, 178, 0.55)';
+    ctx.fillText(Math.round(step * i) + ' cm', cx + 6, cy - r - 4);
+  }
+
+  // angle spokes and labels
+  ctx.textAlign = 'center';
+  for (const a of [-45, -30, -15, 0, 15, 30, 45]) {
+    const x = cx + R * Math.sin(rad(a));
+    const y = cy - R * Math.cos(rad(a));
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(x, y);
+    ctx.strokeStyle = 'rgba(125, 255, 178, 0.16)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+    ctx.fillStyle = 'rgba(125, 255, 178, 0.6)';
+    ctx.fillText(a + '\u00B0', cx + (R + 16) * Math.sin(rad(a)), cy - (R + 16) * Math.cos(rad(a)) + 4);
+  }
+
+  // alert limit arc
+  if (state.mode !== 'idle') {
+    const rl = Math.min(state.thr / state.range, 1) * R;
+    ctx.save();
+    ctx.setLineDash([8, 6]);
+    ctx.beginPath();
+    ctx.arc(cx, cy, rl, th(-HALF), th(HALF));
+    ctx.strokeStyle = 'rgba(255, 90, 90, 0.85)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.restore();
+    ctx.textAlign = 'right';
+    ctx.fillStyle = 'rgba(255, 90, 90, 0.9)';
+    ctx.fillText('LIMIT ' + state.thr + ' cm', cx - 8, cy - rl - 6);
+  }
+
+  // blips (older ones fade out)
+  while (blips.length && now - blips[0].t > FADE_MS) blips.shift();
+  let nearest = null;
+  let alerting = false;
+  ctx.lineCap = 'round';
+  for (const b of blips) {
+    const age = now - b.t;
+    const alpha = Math.max(0, 1 - age / FADE_MS);
+    const r = (b.d / state.range) * R;
+    if (r > R) continue;
+    const red = b.d < b.thr;
+    if (age < 600 && red) alerting = true;
+    if (nearest === null || b.d < nearest.d) nearest = b;
+    const col = red ? '255, 90, 90' : '125, 255, 178';
+    ctx.shadowColor = 'rgba(' + col + ', ' + alpha + ')';
+    ctx.shadowBlur = 12;
+    ctx.strokeStyle = 'rgba(' + col + ', ' + alpha + ')';
+    ctx.lineWidth = 7;
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, th(b.a - 1.3), th(b.a + 1.3));
+    ctx.stroke();
+  }
+  ctx.shadowBlur = 0;
+
+  // sweep trail and line
+  if (live) {
+    for (let i = 0; i < 28; i++) {
+      const a = state.angle - state.dir * i * 0.55;
+      if (a < -HALF || a > HALF) continue;
+      ctx.strokeStyle = 'rgba(125, 255, 178, ' + (0.32 * (1 - i / 28)) + ')';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + R * Math.sin(rad(a)), cy - R * Math.cos(rad(a)));
+      ctx.stroke();
+    }
+    ctx.shadowColor = '#7dffb2';
+    ctx.shadowBlur = 14;
+    ctx.strokeStyle = '#d6ffe6';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx + R * Math.sin(rad(state.angle)), cy - R * Math.cos(rad(state.angle)));
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+  }
+
+  // sensor marker
+  ctx.fillStyle = '#d6ffe6';
+  ctx.beginPath();
+  ctx.arc(cx, cy, 5, 0, Math.PI * 2);
+  ctx.fill();
+
+  updatePanel(now, live, alerting, nearest);
+}
+
+// ---------- readout panel ----------
+let lastPanel = 0;
+function updatePanel(now, live, alerting, nearest) {
+  if (now - lastPanel < 90) return;
+  lastPanel = now;
+
+  rxTimes = rxTimes.filter((t) => now - t < 1000);
+
+  let label, cls;
+  if (state.mode === 'idle') { label = 'NOT CONNECTED'; cls = ''; }
+  else if (state.mode === 'serial' && now - state.lastRx > 1500) { label = 'NO DATA'; cls = 'warn'; }
+  else if (alerting) { label = 'ALERT'; cls = 'alert'; }
+  else { label = state.mode === 'demo' ? 'DEMO' : 'LIVE'; cls = 'ok'; }
+
+  setText('status', label);
+  document.getElementById('dot').className = cls;
+  document.getElementById('panel').classList.toggle('alert', cls === 'alert');
+
+  if (state.mode === 'idle') {
+    setText('rAngle', '--'); setText('rDist', '--'); setText('rLim', '--');
+    setText('rNear', '--'); setText('rRate', '--');
+    return;
+  }
+  setText('rAngle', state.angle + '\u00B0');
+  setText('rDist', state.dist === null ? '---' : state.dist + ' cm');
+  setText('rLim', state.thr + ' cm');
+  setText('rNear', nearest ? nearest.d + ' cm @ ' + nearest.a + '\u00B0' : '---');
+  setText('rRate', rxTimes.length + ' Hz');
+}
+
+// ---------- demo mode ----------
+const demoObjs = [
+  { a: -22, d: 42, w: 5 },
+  { a: 12, d: 22, w: 4 },
+  { a: 33, d: 70, w: 6 },
+];
+let demoA = -HALF, demoDir = 1, demoLast = 0, demoSample = 0;
+
+function demoStep(now) {
+  const dt = Math.min(now - demoLast, 100);
+  demoLast = now;
+  demoA += demoDir * dt * 0.04;                       // about 40 degrees per second
+  if (demoA >= HALF) { demoA = HALF; demoDir = -1; }
+  if (demoA <= -HALF) { demoA = -HALF; demoDir = 1; }
+  demoSample += dt;
+  if (demoSample >= 70) {
+    demoSample = 0;
+    let d = 65535;
+    for (const o of demoObjs) {
+      if (Math.abs(demoA - o.a) < o.w) d = Math.round(o.d + (Math.random() * 3 - 1.5));
+    }
+    ingest(Math.round(demoA), d, 30);
+  }
+}
+
+// ---------- Web Serial ----------
+let port = null;
+let reader = null;
+let keepReading = false;
+
+async function connectSerial() {
+  if (!('serial' in navigator)) {
+    msg('Web Serial is not available. Use Chrome or Edge on a computer.');
+    return;
+  }
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200 });
+  } catch (e) {
+    msg('Could not open the port: ' + e.message + ' (close any serial monitor first)');
+    port = null;
+    return;
+  }
+  stopDemo();
+  blips.length = 0;
+  state.mode = 'serial';
+  state.lastRx = performance.now();
+  syncButtons();
+  readLoop();
+}
+
+async function readLoop() {
+  const decoder = new TextDecoder();
+  let buf = '';
+  keepReading = true;
+  while (port && port.readable && keepReading) {
+    reader = port.readable.getReader();
+    try {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 1);
+          const m = line.match(/R,(-?\d+),(\d+),(\d+)/);
+          if (m) ingest(-parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10));
+        }
+        if (buf.length > 4096) buf = '';
+      }
+    } catch (e) {
+      msg('Serial error: ' + e.message);
+      keepReading = false;
+    } finally {
+      reader.releaseLock();
+    }
+  }
+  await disconnectSerial();
+}
+
+async function disconnectSerial() {
+  keepReading = false;
+  try { if (reader) await reader.cancel(); } catch (e) { /* already closed */ }
+  try { if (port) await port.close(); } catch (e) { /* already closed */ }
+  port = null;
+  reader = null;
+  if (state.mode === 'serial') state.mode = 'idle';
+  syncButtons();
+}
+
+function startDemo() {
+  if (port) disconnectSerial();
+  blips.length = 0;
+  demoLast = performance.now();
+  state.mode = 'demo';
+  syncButtons();
+}
+function stopDemo() {
+  if (state.mode === 'demo') state.mode = 'idle';
+  syncButtons();
+}
+
+// ---------- buttons ----------
+const btnConnect = document.getElementById('btnConnect');
+const btnDemo = document.getElementById('btnDemo');
+
+function syncButtons() {
+  btnConnect.textContent = state.mode === 'serial' ? 'Disconnect' : 'Connect';
+  btnConnect.classList.toggle('on', state.mode === 'serial');
+  btnDemo.classList.toggle('on', state.mode === 'demo');
+}
+
+btnConnect.addEventListener('click', () => {
+  if (state.mode === 'serial') disconnectSerial();
+  else connectSerial();
+});
+btnDemo.addEventListener('click', () => {
+  if (state.mode === 'demo') { state.mode = 'idle'; syncButtons(); }
+  else startDemo();
+});
+document.getElementById('ranges').addEventListener('click', (ev) => {
+  const b = ev.target.closest('button');
+  if (!b) return;
+  state.range = parseInt(b.dataset.r, 10);
+  document.querySelectorAll('#ranges button').forEach((x) => x.classList.toggle('on', x === b));
+});
+
+syncButtons();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
